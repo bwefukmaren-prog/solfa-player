@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Solfa Player</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap">
 <style>
@@ -118,6 +119,7 @@ code { font-family: var(--f-mono); font-size: 0.92em; background: var(--surface2
 </style>
 
 </head>
+
 <body>
 <div class="wrap">
   <header>
@@ -138,7 +140,7 @@ code { font-family: var(--f-mono); font-size: 0.92em; background: var(--surface2
       <div class="photo-preview" id="preview" hidden>
         <img id="previewImg" alt="The sheet music photo you chose">
       </div>
-      <p class="note-small">Reading a photo uses your own Claude usage. It can make mistakes, so check the text below against your sheet.</p>
+      <p class="note-small">Reads printed Tonic Solfa on your device (works offline). Check the text below against your sheet for punctuation accuracy.</p>
     </div>
 
     <div class="field">
@@ -639,86 +641,90 @@ code { font-family: var(--f-mono); font-size: 0.92em; background: var(--surface2
     }
   }
 
-  /* ---------- photo reading ---------- */
-  var PROMPT = [
-    "You are transcribing a photo of Tonic Solfa sheet music (letters d r m f s l t, with the marks : . , - and | showing time). Write it out as plain text using exactly these rules.",
-    "- First line: \"Key: X\" where X is the Doh pitch (for example \"Key: G\") if the sheet shows it, such as \"Key G\" or \"Doh = G\". Leave the line out if it is not shown.",
-    "- Next, \"Tempo: N\" only if a metronome speed is printed.",
-    "- Then the music. Keep one line of music per line of text, in page order. Leave out lyrics, titles and any other words.",
-    "- If several voice parts are written (for example soprano, alto, tenor and bass, often stacked), transcribe every part, one after another, and put a line like \"Part: Soprano\" before each one (use Soprano, Alto, Tenor, Bass, or Part 1, Part 2 if they are not named). If there is only one part, write no Part line.",
-    "- Notes: d r m f s l t. Sharpened notes: de re fe se le. Flattened notes: ra ma sa la ta. A note in the lower octave gets an underscore after it (t_ for a t with a small 1 below). A note in the higher octave gets an apostrophe (d' for a d with a small 1 above).",
-    "- Keep the punctuation exactly as printed: | bar line, : full beat, . half beat, , quarter beat, ., three-quarter beat then quarter beat, - hold. A beat with no note stays empty between its separators, which means a rest.",
-    "- Reply with only the transcription and no commentary. If the photo is not Tonic Solfa (for example it is staff notation) or cannot be read, reply with one line that starts with \"ERROR:\" and explain why."
-  ].join("\n");
+  /* ---------- photo reading (Offline Tesseract OCR) ---------- */
+  var photoInput = $("#photoInput"), preview = $("#preview"), previewImg = $("#previewImg"),
+      readBtn = $("#readBtn"), stopReadBtn = $("#stopReadBtn"), photoFile = null, ocrWorker = null;
 
-  var photoFile = null, ctl = null, previewUrl = null;
-  var readBtn = $("#readBtn"), stopReadBtn = $("#stopReadBtn"), photoInput = $("#photoInput");
-
-  function errCopy(code) {
-    return ({
-      not_granted: "Photo reading needs your permission to use Claude. You can still type the notes.",
-      rate_limited: "You have reached a usage limit for now. Try again later, or type the notes.",
-      image_rejected: "That image could not be used. Try a JPEG or PNG under 20 MB.",
-      session_expired: "Please sign in again, then try once more.",
-      refused: "That photo could not be read. Try a clearer photo of the solfa.",
-      empty_completion: "Nothing came back. Try a clearer photo.",
-      upstream_error: "The connection dropped. Try again."
-    })[code] || "Photo reading did not work this time. You can type the notes instead.";
+  function setReading(busy) {
+    readBtn.disabled = busy || !photoFile;
+    photoInput.disabled = busy;
+    stopReadBtn.hidden = !busy;
   }
 
   photoInput.addEventListener("change", function () {
     var f = photoInput.files && photoInput.files[0];
     if (!f) return;
     photoFile = f;
-    try { if (previewUrl) URL.revokeObjectURL(previewUrl); previewUrl = URL.createObjectURL(f); $("#previewImg").src = previewUrl; $("#preview").hidden = false; } catch (e) {}
+    previewImg.src = URL.createObjectURL(f);
+    preview.hidden = false;
     readBtn.disabled = false;
-    setStatus("Photo ready. Press Read the music.");
+    setStatus("Photo ready. Tap Read the music.");
   });
+
+  function cleanSolfaOCR(raw) {
+    return raw
+      .replace(/[Il1](?=\s*[:.,\-\n|]|$)/g, "|") // Fix barlines misread as I, l, or 1
+      .replace(/;/g, ":")                         // Fix semicolons misread as full-beat colons
+      .replace(/[—–]/g, "-")                      // Normalize en/em dashes
+      .replace(/[^\w\s:.,|\-'’_♯♭#b=]/g, " ")     // Remove stray OCR symbols
+      .replace(/[ \t]+/g, " ")
+      .trim();
+  }
 
   readBtn.addEventListener("click", async function () {
-    if (!photoFile || !window.__sample) return;
-    stop();
-    var prev = srcEl.value;
-    ctl = new AbortController();
-    readBtn.disabled = true; stopReadBtn.hidden = false;
-    setStatus("Reading the sheet. This can take up to a minute.");
+    if (!photoFile) return;
+    if (typeof Tesseract === "undefined") {
+      setStatus("OCR engine is still loading. Please try again in a moment.", true);
+      return;
+    }
+
+    setReading(true);
+    setStatus("Reading sheet music on device…");
+
     try {
-      var res = await window.__sample(PROMPT, {
-        images: photoFile, signal: ctl.signal,
-        onText: function (u) { srcEl.value = u.text; }
+      ocrWorker = await Tesseract.createWorker("eng", 1, {
+        logger: function (m) {
+          if (m.status === "recognizing text") {
+            setStatus("Reading sheet music… " + Math.round(m.progress * 100) + "%");
+          }
+        }
       });
-      var text = (res.text || "").replace(/```[a-z]*\n?/gi, "").trim();
-      if (/^\s*ERROR\s*:/i.test(text)) {
-        srcEl.value = prev;
-        setStatus(text.replace(/^\s*ERROR\s*:\s*/i, "That photo could not be read: "), true);
+      var res = await ocrWorker.recognize(photoFile);
+      await ocrWorker.terminate();
+      ocrWorker = null;
+
+      var cleaned = cleanSolfaOCR(res.data.text);
+      if (!cleaned) {
+        setStatus("Could not detect clear text in that photo. Try a sharper, well-lit crop.", true);
       } else {
-        srcEl.value = text; render(true); save();
-        setStatus("Done. Check the notes against your photo, fix anything that looks wrong, then press Play." + (res.truncated ? " The text was cut short, so the end may be missing." : ""));
+        srcEl.value = cleaned;
+        render(true);
+        save();
+        setStatus("Done. Please check the punctuation (: . , |) against your sheet.");
       }
     } catch (e) {
-      srcEl.value = prev;
-      if (e && e.code === "cancelled") setStatus("Stopped.");
-      else setStatus(errCopy(e && e.code), true);
+      if (ocrWorker) {
+        try { await ocrWorker.terminate(); } catch (_) {}
+        ocrWorker = null;
+      }
+      setStatus("Photo reading stopped or failed.", true);
     } finally {
-      readBtn.disabled = false; stopReadBtn.hidden = true; ctl = null;
+      setReading(false);
     }
   });
-  stopReadBtn.addEventListener("click", function () { if (ctl) ctl.abort(); });
 
-  async function initPhoto() {
-    var ok = false;
-    try {
-      var s = window.claude && window.claude.use ? await window.claude.use("sample") : null;
-      if (s) {
-        var lim = await s.limits();
-        if (lim && lim.images) {
-          ok = true; window.__sample = s;
-          photoInput.accept = lim.images.mediaTypes.join(",");
-        }
-      }
-    } catch (e) { ok = false; }
-    $("#photoBox").hidden = !ok;
-    $("#noPhoto").hidden = ok;
+  stopReadBtn.addEventListener("click", async function () {
+    if (ocrWorker) {
+      await ocrWorker.terminate();
+      ocrWorker = null;
+      setStatus("Stopped reading photo.");
+      setReading(false);
+    }
+  });
+
+  function initPhoto() {
+    $("#photoBox").hidden = false;
+    $("#noPhoto").hidden = true;
   }
 
   restore(); setPlayUi();
@@ -726,6 +732,15 @@ code { font-family: var(--f-mono); font-size: 0.92em; background: var(--surface2
   initPhoto();
   window.addEventListener("pagehide", stop);
 })();
+
+/* ---------- offline service worker ---------- */
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("./sw.js").catch(function (err) {
+      console.warn("Service worker registration failed:", err);
+    });
+  });
+}
 </script>
 </body>
 </html>
